@@ -179,3 +179,9 @@ func getVideoAspectRatio(filepath string) (string, error) {
 func withinDelta(a, b, tolerance float64) bool {
 	return math.Abs(a-b) <= tolerance
 }
+
+func processVideoForFastStart(filepath string) (string, error) {
+	outputFilepath := filepath + ".processing"
+	exec.Command("ffmpeg", "-i", filepath, "-c", "copy", "-movflags", "faststart", "-f", "-mp4", outputFilepath)
+	return outputFilepath, nil
+}
