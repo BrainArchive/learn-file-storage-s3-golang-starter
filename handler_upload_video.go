@@ -181,6 +181,8 @@ func withinDelta(a, b, tolerance float64) bool {
 }
 
 func processVideoForFastStart(filepath string) (string, error) {
+	// moov atom for mp4 files is generally at the "end" of the file.
+	// this function creates a new video that moves it to the start of the file.
 	outputFilepath := filepath + ".processing"
 	exec.Command("ffmpeg", "-i", filepath, "-c", "copy", "-movflags", "faststart", "-f", "-mp4", outputFilepath)
 	return outputFilepath, nil
