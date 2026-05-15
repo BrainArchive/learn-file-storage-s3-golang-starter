@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -13,9 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
+	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/database"
 	"github.com/google/uuid"
 )
 
@@ -81,10 +84,12 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	f, err := os.CreateTemp("", "tubely-upload.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error handling video file", err)
+		return
 	}
 
 	defer os.Remove(f.Name())
 	defer f.Close()
+
 	_, err = io.Copy(f, videoFile)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error handling video file", err)
@@ -94,7 +99,21 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "error handling video file", err)
 		return
 	}
-	ratio, err := getVideoAspectRatio(f.Name())
+
+	fProcessed, err := processVideoForFastStart(f.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error processing video file", err)
+		return
+	}
+	newF, err := os.Open(fProcessed)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error processing video file", err)
+		return
+	}
+	defer os.Remove(newF.Name())
+	defer newF.Close()
+
+	ratio, err := getVideoAspectRatio(newF.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error reading file metadata", err)
 		return
@@ -119,14 +138,15 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &newFilename,
-		Body:        f,
+		Body:        newF,
 		ContentType: &mediaType,
 	})
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error uploading videofile", err)
+		return
 	}
 
-	newVideoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, newFilename)
+	newVideoURL := fmt.Sprintf("%s,%s", cfg.s3Bucket, newFilename)
 	video.VideoURL = &newVideoURL
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
@@ -134,7 +154,43 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, video)
+	presignedVideo, err := cfg.dbVideoToSignedVideo(video)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error getting presignedURL", err)
+		return
+	}
+	respondWithJSON(w, http.StatusOK, presignedVideo)
+}
+func generatePresignedURL(s3Client *s3.Client, bucket, key string, expireTime time.Duration) (string, error) {
+	presignClient := s3.NewPresignClient(s3Client)
+
+	PresignedURLRequest, err := presignClient.PresignGetObject(
+		context.Background(),
+		&s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &key,
+		},
+		s3.WithPresignExpires(expireTime))
+	if err != nil {
+		return "", err
+	}
+
+	return PresignedURLRequest.URL, nil
+}
+
+func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
+	if video.VideoURL == nil {
+		return video, nil
+	}
+
+	bucketKey := strings.Split(*video.VideoURL, ",")
+	// videoURL is stored as <bucket>,<key>
+	presignedURL, err := generatePresignedURL(cfg.s3Client, bucketKey[0], bucketKey[1], time.Hour)
+	if err != nil {
+		return database.Video{}, err
+	}
+	video.VideoURL = &presignedURL
+	return video, nil
 }
 
 type VideoStream struct {
@@ -184,6 +240,11 @@ func processVideoForFastStart(filepath string) (string, error) {
 	// moov atom for mp4 files is generally at the "end" of the file.
 	// this function creates a new video that moves it to the start of the file.
 	outputFilepath := filepath + ".processing"
-	exec.Command("ffmpeg", "-i", filepath, "-c", "copy", "-movflags", "faststart", "-f", "-mp4", outputFilepath)
+	cmd := exec.Command("ffmpeg", "-i", filepath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilepath)
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
 	return outputFilepath, nil
 }
